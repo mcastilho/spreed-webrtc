@@ -1,6 +1,6 @@
 /*
  * Spreed WebRTC.
- * Copyright (C) 2013-2014 struktur AG
+ * Copyright (C) 2013-2015 struktur AG
  *
  * This file is part of Spreed WebRTC.
  *
@@ -29,21 +29,12 @@ type Sender interface {
 	Send(Buffer)
 }
 
-type ResponseSender interface {
-	Sender
-	Responder
-}
-
-type Responder interface {
-	Reply(iid string, m interface{})
-}
-
 type Client interface {
-	ResponseSender
+	Sender
 	Session() *Session
 	Index() uint64
 	Close()
-	ReplaceAndClose()
+	ReplaceAndClose(Client)
 }
 
 type client struct {
@@ -59,7 +50,11 @@ func NewClient(codec Codec, api ChannellingAPI, session *Session) *client {
 
 func (client *client) OnConnect(conn Connection) {
 	client.Connection = conn
-	client.ChannellingAPI.OnConnect(client, client.session)
+	if reply, err := client.ChannellingAPI.OnConnect(client, client.session); err == nil {
+		client.reply("", reply)
+	} else {
+		log.Println("OnConnect error", err)
+	}
 }
 
 func (client *client) OnDisconnect() {
@@ -68,14 +63,20 @@ func (client *client) OnDisconnect() {
 }
 
 func (client *client) OnText(b Buffer) {
-	if incoming, err := client.DecodeIncoming(b); err == nil {
-		client.OnIncoming(client, client.session, incoming)
-	} else {
+	incoming, err := client.DecodeIncoming(b)
+	if err != nil {
 		log.Println("OnText error while processing incoming message", err)
+		return
+	}
+
+	if reply, err := client.OnIncoming(client, client.session, incoming); err != nil {
+		client.reply(incoming.Iid, err)
+	} else if reply != nil {
+		client.reply(incoming.Iid, reply)
 	}
 }
 
-func (client *client) Reply(iid string, m interface{}) {
+func (client *client) reply(iid string, m interface{}) {
 	outgoing := &DataOutgoing{From: client.session.Id, Iid: iid, Data: m}
 	if b, err := client.EncodeOutgoing(outgoing); err == nil {
 		client.Send(b)
@@ -87,9 +88,15 @@ func (client *client) Session() *Session {
 	return client.session
 }
 
-func (client *client) ReplaceAndClose() {
-	client.session.Close()
-	if client.Connection != nil {
-		client.Connection.Close()
-	}
+func (client *client) ReplaceAndClose(oldClient Client) {
+	oldSession := oldClient.Session()
+	client.session.Replace(oldSession)
+	go func() {
+		// Close old session and client in another go routine,
+		// to avoid blocking the new client if the old one hangs or
+		// whatever.
+		log.Printf("Closing obsolete client %d (replaced with %d) with id %s\n", oldClient.Index(), client.Index(), oldSession.Id)
+		oldSession.Close()
+		oldClient.Close()
+	}()
 }
